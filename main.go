@@ -1,10 +1,12 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"go/build"
 	"io"
 	"io/ioutil"
 	"log"
@@ -17,69 +19,72 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/mitchellh/go-spdx"
-	"gopkg.in/src-d/go-license-detector.v3/licensedb"
-	"gopkg.in/src-d/go-license-detector.v3/licensedb/api"
-	"gopkg.in/src-d/go-license-detector.v3/licensedb/filer"
-)
-
-const (
-	apache2 = "Apache-2.0"
-	unknown = "unknown"
+	"github.com/karrick/godirwalk"
 )
 
 var (
-	inFlag       = flag.String("in", "-", "Dependency list (output from go list -deps -json)")
-	outFlag      = flag.String("out", "-", "Path to output the notice information")
-	templateFlag = flag.String("template", "NOTICE.txt.tmpl", "Path to the template file")
+	inFlag              = flag.String("in", "-", "Dependency list (output from go list -m -json all)")
+	includeIndirectFlag = flag.Bool("includeIndirect", false, "Include indirect dependencies")
+	outFlag             = flag.String("out", "-", "Path to output the notice information")
+	templateFlag        = flag.String("template", "NOTICE.txt.tmpl", "Path to the template file")
 
-	copyrightRegex = regexp.MustCompile(`[Cc]opyright\s+\(\s*[Cc]\s*\)`)
+	errLicenceNotFound = errors.New("failed to detect licence")
+	goModCache         = filepath.Join(build.Default.GOPATH, "pkg", "mod")
+	licenceRegex       = buildLicenceRegex()
 )
 
-type Package struct {
-	ImportPath string `json:"ImportPath"`
-	GoRoot     bool   `json:"GoRoot"`
-	Standard   bool   `json:"Standard"`
-	DepOnly    bool   `json:"DepOnly"`
-	Root       string `json:"Root"`
+type Dependencies struct {
+	Direct   []LicenceInfo
+	Indirect []LicenceInfo
 }
 
 type LicenceInfo struct {
-	Pkg       string
-	Root      string
-	Copyright string
+	Module
+	LicenceFile string
+	Error       error
 }
 
-type NoticeData struct {
-	LicenceName  string
-	LicenceText  string
-	Dependencies []LicenceInfo
+type Module struct {
+	Path     string     // module path
+	Version  string     // module version
+	Main     bool       // is this the main module?
+	Time     *time.Time // time version was created
+	Indirect bool       // is this module only an indirect dependency of main module?
+	Dir      string     // directory holding files for this module, if any
+}
+
+func buildLicenceRegex() *regexp.Regexp {
+	// inspired by https://github.com/src-d/go-license-detector/blob/7961dd6009019bc12778175ef7f074ede24bd128/licensedb/internal/investigation.go#L29
+	licenceFileNames := []string{
+		`li[cs]en[cs]es?`,
+		`legal`,
+		`copy(left|right|ing)`,
+		`unlicense`,
+		`l?gpl([-_ v]?)(\d\.?\d)?`,
+		`bsd`,
+		`mit`,
+		`apache`,
+	}
+
+	regexStr := fmt.Sprintf(`^(?i:(%s)(\.(txt|md|rst))?)$`, strings.Join(licenceFileNames, "|"))
+	return regexp.MustCompile(regexStr)
 }
 
 func main() {
 	flag.Parse()
 	depInput, err := mkReader(*inFlag)
 	if err != nil {
-		log.Fatalf("failed to create reader for %s: %v", *inFlag, err)
+		log.Fatalf("Failed to create reader for %s: %v", *inFlag, err)
 	}
 	defer depInput.Close()
 
-	depList, err := parseDependencies(depInput)
+	dependencies, err := parseDependencies(depInput, *includeIndirectFlag)
 	if err != nil {
 		log.Fatalf("Failed to parse dependencies: %v", err)
 	}
 
-	licences, err := detectLicences(depList)
-	if err != nil {
-		log.Fatalf("Failed to detect licences: %v", err)
-	}
-
-	noticeData, err := generateNoticeData(licences)
-	if err != nil {
-		log.Fatalf("Failed to generate notice data: %v", err)
-	}
-
-	if err := renderNotice(noticeData, *templateFlag, *outFlag); err != nil {
+	detectLicences(&dependencies)
+	if err := renderNotice(dependencies, *templateFlag, *outFlag); err != nil {
 		log.Fatalf("Failed to render notice: %v", err)
 	}
 }
@@ -92,125 +97,83 @@ func mkReader(path string) (io.ReadCloser, error) {
 	return os.Open(path)
 }
 
-func parseDependencies(data io.Reader) ([]Package, error) {
+func parseDependencies(data io.Reader, includeIndirect bool) (Dependencies, error) {
+	deps := Dependencies{}
 	decoder := json.NewDecoder(data)
-	var packageList []Package
 	for {
-		var pkg Package
-		if err := decoder.Decode(&pkg); err != nil {
+		var mod Module
+		if err := decoder.Decode(&mod); err != nil {
 			if err == io.EOF {
-				return packageList, nil
+				return deps, nil
 			}
-			return packageList, fmt.Errorf("failed to parse dependencies: %w", err)
+			return deps, fmt.Errorf("failed to parse dependencies: %w", err)
 		}
 
-		if !pkg.GoRoot && pkg.DepOnly {
-			packageList = append(packageList, pkg)
-		}
-	}
-}
-
-func detectLicences(deps []Package) (map[string][]LicenceInfo, error) {
-	groupedLicences := make(map[string][]LicenceInfo)
-	for _, dep := range deps {
-		info := LicenceInfo{Pkg: dep.ImportPath, Root: dep.Root}
-
-		f, err := filer.FromDirectory(dep.Root)
-		if err != nil {
-			return groupedLicences, fmt.Errorf("failed to create filer for path %s: %w", dep.Root, err)
-		}
-
-		licences, err := licensedb.Detect(f)
-		if err != nil {
-			if err == licensedb.ErrNoLicenseFound {
-				groupedLicences[unknown] = append(groupedLicences[unknown], info)
+		if !mod.Main && mod.Dir != "" {
+			if mod.Indirect {
+				if includeIndirect {
+					deps.Indirect = append(deps.Indirect, LicenceInfo{Module: mod})
+				}
 				continue
 			}
-			return groupedLicences, fmt.Errorf("failed to detect licence for %s: %w", dep.ImportPath, err)
+			deps.Direct = append(deps.Direct, LicenceInfo{Module: mod})
 		}
-
-		name, file := determineBestLicence(licences)
-		// TODO fail?
-		info.Copyright, _ = detectCopyright(name, filepath.Join(dep.Root, file))
-
-		groupedLicences[name] = append(groupedLicences[name], info)
 	}
 
-	return groupedLicences, nil
+	sort.Slice(deps.Direct, func(i, j int) bool {
+		return deps.Direct[i].Path < deps.Direct[j].Path
+	})
+
+	sort.Slice(deps.Indirect, func(i, j int) bool {
+		return deps.Indirect[i].Path < deps.Indirect[j].Path
+	})
+
+	return deps, nil
 }
 
-func determineBestLicence(licences map[string]api.Match) (name, file string) {
-	var maxConfidence float32
-	for licName, licInfo := range licences {
-		if licInfo.Confidence > maxConfidence {
-			maxConfidence = licInfo.Confidence
-			name = licName
-			for licFile, confidence := range licInfo.Files {
-				if confidence == licInfo.Confidence {
-					file = licFile
-					break
-				}
+func detectLicences(deps *Dependencies) {
+	for _, depList := range [][]LicenceInfo{deps.Direct, deps.Indirect} {
+		for i, dep := range depList {
+			depList[i].LicenceFile, depList[i].Error = findLicenceFile(dep.Dir)
+			if depList[i].Error != nil && depList[i].Error != errLicenceNotFound {
+				panic(fmt.Errorf("unexpected error while processing %s: %v", dep.Path, depList[i].Error))
 			}
 		}
 	}
-
-	return
 }
 
-func detectCopyright(licence, filePath string) (string, error) {
-	if licence == apache2 {
-		return "", nil
-	}
-
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if copyrightRegex.MatchString(line) {
-			return line, nil
-		}
-	}
-
-	return "", scanner.Err()
-}
-
-func generateNoticeData(licences map[string][]LicenceInfo) ([]NoticeData, error) {
-	var notices []NoticeData
-	for licID, licInfo := range licences {
-		if licID == unknown {
-			notices = append(notices, NoticeData{LicenceName: "Licence Unknown", Dependencies: licInfo})
-			continue
-		}
-
-		licData, err := spdx.License(licID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to lookup licence [%s]: %w", licID, err)
-		}
-
-		notice := NoticeData{
-			LicenceName:  licData.Name,
-			LicenceText:  licData.Text,
-			Dependencies: licInfo,
-		}
-		notices = append(notices, notice)
-	}
-
-	sort.Slice(notices, func(i, j int) bool {
-		return notices[i].LicenceName < notices[j].LicenceName
+func findLicenceFile(root string) (string, error) {
+	errStopWalk := errors.New("stop walk")
+	var licenceFile string
+	err := godirwalk.Walk(root, &godirwalk.Options{
+		Callback: func(osPathName string, dirent *godirwalk.Dirent) error {
+			if licenceRegex.MatchString(dirent.Name()) {
+				if dirent.IsDir() {
+					return filepath.SkipDir
+				}
+				licenceFile = osPathName
+				return errStopWalk
+			}
+			return nil
+		},
+		Unsorted: true,
 	})
 
-	return notices, nil
+	if err != nil {
+		if errors.Is(err, errStopWalk) {
+			return licenceFile, nil
+		}
+		return "", err
+	}
+
+	return "", errLicenceNotFound
 }
 
-func renderNotice(noticeData []NoticeData, templatePath, outputPath string) error {
+func renderNotice(dependencies Dependencies, templatePath, outputPath string) error {
 	funcMap := template.FuncMap{
 		"currentYear": CurrentYear,
-		"header":      Header,
+		"line":        Line,
+		"licenceText": LicenceText,
 	}
 	tmpl, err := template.New(filepath.Base(templatePath)).Funcs(funcMap).ParseFiles(templatePath)
 	if err != nil {
@@ -223,7 +186,7 @@ func renderNotice(noticeData []NoticeData, templatePath, outputPath string) erro
 	}
 	defer cleanup()
 
-	if err := tmpl.Execute(w, noticeData); err != nil {
+	if err := tmpl.Execute(w, dependencies); err != nil {
 		return fmt.Errorf("failed to render template: %w", err)
 	}
 
@@ -243,7 +206,30 @@ func CurrentYear() string {
 	return strconv.Itoa(time.Now().Year())
 }
 
-func Header(text string) string {
-	line := strings.Repeat("-", len(text))
-	return strings.Join([]string{line, text, line}, "\n")
+func Line(ch string) string {
+	return strings.Repeat(ch, 80)
+}
+
+func LicenceText(licInfo LicenceInfo) string {
+	if licInfo.Error != nil {
+		return licInfo.Error.Error()
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("Contents of probable licence file ")
+	buf.WriteString(strings.Replace(licInfo.LicenceFile, goModCache, "$GOMODCACHE", -1))
+	buf.WriteString(":\n\n")
+
+	f, err := os.Open(licInfo.LicenceFile)
+	if err != nil {
+		panic(fmt.Errorf("failed to open licence file %s: %v", licInfo.LicenceFile, err))
+	}
+	defer f.Close()
+
+	_, err = io.Copy(&buf, f)
+	if err != nil {
+		panic(fmt.Errorf("failed to read licence file %s: %v", licInfo.LicenceFile, err))
+	}
+
+	return buf.String()
 }
